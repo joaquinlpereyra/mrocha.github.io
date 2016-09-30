@@ -1,0 +1,67 @@
+<p>
+En el diff del fix para <a href="http://goo.gl/ZhNyzu">CVE-2016-2776</a>, el cambio mas interesante es en <tt>dns_message_renderbegin()</tt>
+</p>
+<img src="cacona.jpg"/>
+<p>
+Comparando a simple vista podemos intuir que existia comportamiento indefinido cuando <tt>r.length &lt; msg-&gt;reserved</tt> daba <tt>FALSE</tt> (osea, todo estaba joya) pero <tt>r.length - DNS_MESSAGE_HEADERLEN &lt; msg-&gt;reserved</tt> es <tt>TRUE</tt> (no, para, ESTO es lo que tenemos que chequear). Por lo tanto, el bug potencialmente ocurre cuando se daba la siguiente condicion:
+</p>
+<blockquote>
+<tt>not (r.length &lt; msg-&gt;reserved) and (r.length - DNS_MESSAGE_HEADERLEN &lt; msg-&gt;reserved)</tt><br/><br/>
+<tt>(r.length &gt;= msg-&gt;reserved) and (r.length - DNS_MESSAGE_HEADERLEN &lt; msg-&gt;reserved)</tt><br/><br/>
+<b><tt>r.length - DNS_MESSAGE_HEADERLEN &lt; msg-&gt;reserved &lt;= r.length</tt></b>
+</blockquote>
+<p>
+Mirando <tt><a href="https://goo.gl/J3HpcE">dns_message_renderbegin()</a></tt> notamos que <tt>r.length</tt> describe el espacio disponible en <tt>isc_buffer_t buffer</tt>, que es donde la respuesta del server sera escrita. Esta se calcula como <tt>buffer-&gt;length - buffer-&gt;used</tt> (no seas vago y fijate en el codigo si no me crees). De acuerdo a como construyamos la query, podemos asegurar que <tt>r.length</tt> sea igual a un valor conocido dado que representa el tamanio maximo que la respuesta puede tener al empezar a construirse (despues de todo estamos en dns_message_render***BEGIN***()). En nuestro caso, podemos asegurar que sea 512. Ademas, <tt>DNS_MESSAGE_HEADERLEN</tt> es simplemente una constante de valor 12. En definitiva, si logramos que <b><tt>500 &lt; msg-&gt;reserved &lt;= 512</tt></b>, podemos triggerear la condicion fixeada.
+</p>
+<p>
+Pero que es <tt>msg-&gt;reserved</tt>? En <tt><a href="http://goo.gl/fwwNLG">lib/dns/message.c</a></tt>, podemos ver que es una variable que indica cuantos bytes se desean reservar en <tt>msg-&gt;buffer</tt> para posterior uso. Solo se manipula con las funciones <tt>dns_message_renderreserve()</tt> y <tt>dns_message_renderrelease()</tt>. La parte que da miedo es lo que hace usa para lograr su cometido. En <a href="https://goo.gl/kQfz1l">dns_message_rendersection()</a> se puede ver que modifica el estado interno de <tt>msg-&gt;buffer</tt>, precisamente <tt>msg-&gt;buffer-&gt;length</tt>, con el motivo de que posteriores manipulaciones sobre ese buffer crean que su tamanio real es mas chico.
+</p>
+<img src="elmarron.jpg"/>
+<p>
+Pero aguanta, vieron la implementacion de la lib que manipula <a href="https://goo.gl/aZ5y2t"><tt>isc_buffer_t</tt></a>? (sip, el famoso <tt>buffer.c</tt>) Cada funcion hace bocha de aserciones sobre <tt>isc_buffer_t</tt> para asegurarse de que no esta haciendo cagadas y termine potencialmente corrompiendo memoria. Hay que tener en cuenta cuidadosamente el resto del estado de <tt>isc_buffer_t</tt> para recien despues cambiarlo. Como el CVE describe que una asercion se dispara desde </tt>buffer.c</tt>, claramente existe un contexto en donde <tt>msg-&gt;reserved</tt> termina dejando el buffer en un estado indefinido y que el proceso aborta en el siguiente uso de alguna funcion de <tt>buffer.c</tt>.
+</p>
+<p>
+Convencidos de que <tt>msg-&gt;reserved</tt> es malo malo y que es especialmente malo malo cuando <tt>500 &lt; msg-&gt;reserved &lt;= 512</tt>, queda ver como podemos manipular esta variable a gusto del comensal. Trackeando el uso de <tt>dns_message_renderreserve()</tt> en <tt><a href="http://goo.gl/fwwNLG">lib/dns/message.c</a></tt> encontramos que <tt>msg-&gt;reserved</tt> es utilizada para trackear cuantos bytes seran necesarios para escribir los Additional RR (OPT, TSIG y SIG(0)) una vez que se termine de renderear la respuesta en <tt>dns_message_renderend()</tt>.
+</p>
+<p>
+La forma mas directa que encontre de manipular un Additional RR incluido en la respuesta es enviar una query con un TSIG RR conteniendo una firma invalida. En este caso, el server hace echo de practicamente todo el record al responder.
+</p>
+<p>
+El siguiente script envia una query A al server con un TSIG lo suficientemente grande para que <tt>named</tt>, al escribir la respuesta, necesite reservar 501 bytes en <tt>msg-&gt;reserved</tt>
+</p>
+<p>
+aca pone el script rata
+</p>
+<img src="pre-coitus.jpg"/>
+<img src="coitus.jpg"/>
+<img src="post-coitus.jpg"/>
+<p>
+Soooo eaaasy! Pero que fue lo que termino pasando? Para empezar, en la captura de Wireshark se puede ver que el TSIG RR de la query es de 517 bytes. Esto es porque la representacion en memoria de la firma que mantiene <tt>named</tt> luego de parsear el mensaje ocupa menos espacio que el record original. En mi caso, realizando las pruebas en bind9 version 9.10.3.dfsg.P4-10.1 para Debian stretch/sid, necesito agregar 16 bytes adicionales para compensar la reduccion en memoria. Ahora veamos que pasa dentro del proceso.
+</p>
+<p>
+Luego de parsear el request y fallar al validar la firma que trae, el proceso empieza a renderear la respuesta de error. Para ello, antes incluso de llamar a <tt>dns_message_renderbegin()</tt> (fundamental por cosas que no valen la pena detallar... mejor dicho: "ejercicio para el lector") ya reserva <tt>msg-&gt;sig_reserved</tt> bytes (calculados desde la firma devuelta por <tt>spacefortsig()</tt>) con la funcion <tt>dns_message_renderreserve()</tt>. En nuestro caso, como nosotros queriamos, reserva 501 bytes.
+</p>
+<img src="dirtyohsodirty-1.jpg"/>
+<p>
+Para cuando termina llegando a <tt>dns_message_renderbegin()</tt> tenemos el escenario que buscabamos, <tt>msg-&gt;reserved</tt> en 501 y <tt>r.length</tt> en 512. El chequeo de espacio que tendria que arrojar <tt>ISC_R_NOSPACE</tt> no se triggerea.
+</p>
+<img src="dirtyohsodirty-2.jpg"/>
+<p>
+Ya con la instruccion posterior a la validacion se huele porque es tan importante considerar tambien <tt>DNS_MESSAGE_HEADERLEN</tt>. Inmediatamente luego de validar que <tt>buffer</tt> tenga el espacio suficiente para almacenar <tt>msg-&gt;reserved</tt> bytes, se aloca en el buffer <tt>DNS_MESSAGE_HEADERLEN</tt> (12) bytes. Osea, no se comprobo si luego de reservar esos bytes, habia lugar suficiente para almacenar 12 mas. Y como el invento de <tt>msg-&gt;reserved</tt> va por fuera de las capacidades de las funciones de <tt>buffer.c</tt>, <tt>isc_buffer_add()</tt> no tiene forma de prevenirlo. En definitiva, al retornar de la funcion, tenemos que el espacio disponible de <tt>buffer</tt> es de 500 bytes (<tt>buffer-&gt;length - buffer-&gt;used</tt> = 512 - 12 = 500) pero ya estamos reservando 501 a futuro. Ta todo mal!
+</p>
+<img src="dirtyohsodirty-3.jpg"/>
+<p>
+Cuando llegamos a <tt>dns_message_rendersection()</tt> y se hace uso de <tt>msg-&gt;reserved</tt>, la valides de la estructura <tt>isc_buffer_t msg-&gt;buffer</tt> se corrompe. Ahora <tt>msg-&gt;buffer-&gt;used</tt> es MAYOR que <tt>msg-&gt;buffer-&gt;length</tt>. La nafta esta, la maderita tambien, solo hace falta el chispazo.
+</p>
+<img src="dirtyohsodirty-4.jpg"/>
+<p>
+PUMBA!!
+</p>
+<img src="dirtyohsodirty-5.jpg"/>
+<p>
+Como se esperaba, al llamarse a <tt>isc_buffer_add()</tt> mas adelante en la misma funcion, las aserciones que aseguran la integridad del buffer revientan. Para cualquier <tt>n</tt> (no tecnica y pedantemente grande), <tt>msg-&gt;buffer-&gt;used &gt; msg-&gt;buffer-&gt;length</tt>.
+</p>
+<img src="paraquemegasto.jpg"/>
+<p>
+Y asi termina el cuento. Moraleja: Si tenes abstracciones que te cuidan, no las pinches.
+</p>
